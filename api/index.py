@@ -1,42 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Standalone FamPay UPI Payment & Gmail IMAP Verification API (Vercel Ready)
-"""
-
 import os
 import re
 import json
 import time
-import hmac
-import hashlib
 import random
 import imaplib
 import email
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
-from urllib.parse import urlencode, quote, urlparse, parse_qs
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler
+
+# Firebase Imports
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ============================================================================
 # 1. CONFIGURATION
 # ============================================================================
-_DEFAULT_DIR = os.path.dirname(os.path.abspath(__file__))
-_STORAGE_DIR = _DEFAULT_DIR if os.access(_DEFAULT_DIR, os.W_OK) else "/tmp"
-
 CONFIG = {
     "fampay_upi": os.environ.get("FAMPAY_UPI_ID", "shahid4900@fam"),
     "gmail_email": os.environ.get("GMAIL_EMAIL", "shahid2005afridi@gmail.com"),
     "gmail_app_password": re.sub(r"\s+", "", os.environ.get("GMAIL_APP_PASSWORD", "fjrpfhfjzykefhga")),
     "merchant_name": os.environ.get("MERCHANT_NAME", "Dgtl Store"),
-    "api_brand": os.environ.get("API_BRAND", "Sharmaji"),
     "api_key": os.environ.get("FAMPAY_API_KEY", "fp_live_5dd46fe835de54e91b6c4f9aabc0ea3d"),
-    "webhook_url": os.environ.get("WEBHOOK_URL", ""),
-    "webhook_secret": os.environ.get("WEBHOOK_SECRET", "whsec_2db71a9ee8f38b1d94aa568fbbfd461c"),
     "expiry_minutes": int(os.environ.get("EXPIRY_MINUTES", "15")),
-    "storage_file": os.path.join(_STORAGE_DIR, ".fampay_orders.json"),
 }
 
 FAMPAY_SENDER_HINTS = [
@@ -47,114 +37,99 @@ FAMPAY_SENDER_HINTS = [
 ]
 
 # ============================================================================
-# 2. ORDER STORAGE & UPI QR BUILDER
+# 2. FIREBASE INITIALIZATION
 # ============================================================================
-def load_orders():
-    if not os.path.isfile(CONFIG["storage_file"]):
-        return {}
+def get_db():
     try:
-        with open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+        if not firebase_admin._apps:
+            project_id = os.environ.get("FIREBASE_PROJECT_ID")
+            client_email = os.environ.get("FIREBASE_CLIENT_EMAIL")
+            private_key = os.environ.get("FIREBASE_PRIVATE_KEY")
+            
+            # Handle escaped newlines in private key (Vercel ke liye zaroori hai)
+            if private_key:
+                private_key = private_key.replace('\\n', '\n')
 
+            cred_dict = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key": private_key,
+                "client_email": client_email,
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        print("Firebase Init Error:", e)
+        return None
 
-def save_orders(orders):
-    try:
-        with open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
-            json.dump(orders, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+db = get_db()
 
+def save_order_db(order_id, order_data):
+    if db:
+        try:
+            db.collection("orders").document(order_id).set(order_data)
+        except Exception as e:
+            print("Firebase Save Error:", e)
 
+def get_order_db(order_id):
+    if db:
+        try:
+            doc = db.collection("orders").document(order_id).get()
+            if doc.exists:
+                return doc.to_dict()
+        except Exception as e:
+            print("Firebase Get Error:", e)
+    return None
+
+# ============================================================================
+# 3. HELPERS
+# ============================================================================
 def reconstruct_serverless_order(order_id):
     m = re.match(r"^ord_(\d{10})_(\d+)_(\d+)$", str(order_id or "").strip())
-    if not m:
-        return None
+    if not m: return None
     created_ts = int(m.group(1))
     paise = int(m.group(2))
     reference = m.group(3)
     amount = round(paise / 100.0, 2)
     exp_ts = created_ts + (CONFIG["expiry_minutes"] * 60)
     return {
-        "id": order_id,
-        "amount": amount,
-        "payable_amount": amount,
-        "provider": "fampay",
-        "upi_id": CONFIG["fampay_upi"],
-        "reference": reference,
-        "utr": None,
-        "status": "pending",
-        "created_ts": created_ts,
-        "expires_ts": exp_ts,
+        "id": order_id, "amount": amount, "payable_amount": amount,
+        "provider": "fampay", "upi_id": CONFIG["fampay_upi"], "reference": reference,
+        "utr": None, "status": "pending", "created_ts": created_ts, "expires_ts": exp_ts,
         "created_at": datetime.fromtimestamp(created_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "paid_at": None,
+        "expires_at": datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "paid_at": None,
     }
-
 
 def build_upi_link(upi_id, amount, merchant_name, order_id, reference):
     note = order_id or reference or "Payment"
     tr = reference or order_id or ""
-    return (
-        f"upi://pay?pa={quote(upi_id)}"
-        f"&pn={quote(merchant_name or 'Merchant')}"
-        f"&am={amount:.2f}"
-        f"&cu=INR"
-        f"&tn={quote(note)}"
-        f"&tr={quote(tr)}"
-    )
+    return f"upi://pay?pa={quote(upi_id)}&pn={quote(merchant_name)}&am={amount:.2f}&cu=INR&tn={quote(note)}&tr={quote(tr)}"
 
 # ============================================================================
-# 3. EMAIL PARSING ENGINE
+# 4. EMAIL PARSING
 # ============================================================================
 def looks_like_fampay(sender, subject, body_preview):
     haystack = f"{sender} {subject} {body_preview[:1000]}".lower()
     return any(hint in haystack for hint in FAMPAY_SENDER_HINTS)
 
-
 def extract_fampay_txn_id(text):
-    if not text:
-        return None
     m = re.search(r"\b(FMP[A-Z0-9]{8,24})\b", text, re.IGNORECASE)
     return m.group(1) if m else None
 
-
 def extract_utr(text):
-    if not text:
-        return None
     explicit = re.search(r"UTR\s*[:\s#]*([0-9]{12})", text, re.IGNORECASE)
-    if explicit:
-        return explicit.group(1)
+    if explicit: return explicit.group(1)
     fmp = extract_fampay_txn_id(text)
-    if fmp:
-        return fmp
+    if fmp: return fmp
     bare = re.search(r"(?:^|[^A-Za-z0-9])([0-9]{12})(?:[^A-Za-z0-9]|$)", text)
     return bare.group(1) if bare else None
 
-
-def extract_purpose(text):
-    if not text:
-        return None
-    direct = re.search(r"\b((?:test_)?ord_?[a-zA-Z0-9]{6,32})\b", text, re.IGNORECASE)
-    if direct:
-        return direct.group(1)
-    m = re.search(r"(?:Purpose|Note|Remark|Remarks|Description|Message)[:\s]+([A-Za-z0-9_\-]{6,40})", text, re.IGNORECASE)
-    return m.group(1) if m else None
-
-
 def extract_amount(text):
-    if not text:
-        return None
     patterns = [
         r"(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)",
         r"received\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{1,2})?)",
-        r"credited\s*(?:with|by|for)?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{1,2})?)",
-        r"paid\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{1,2})?)",
-        r"amount\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{1,2})?)",
-        r"([\d,]+(?:\.\d{1,2})?)\s*(?:Rs|INR|₹)",
-        r"you(?:'ve|\s+have)?\s+(?:successfully\s+)?received\s+(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{1,2})?)",
         r"₹\s*([\d,]+(?:\.\d{1,2})?)",
     ]
     for pat in patterns:
@@ -162,126 +137,74 @@ def extract_amount(text):
         if m and m.group(1):
             try:
                 val = float(m.group(1).replace(",", ""))
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
+                if val > 0: return val
+            except ValueError: pass
     return None
 
+def extract_purpose(text):
+    direct = re.search(r"\b((?:test_)?ord_?[a-zA-Z0-9]{6,32})\b", text, re.IGNORECASE)
+    return direct.group(1) if direct else None
 
 def decode_mime_header_str(value):
-    if not value:
-        return ""
+    if not value: return ""
     parts = decode_header(value)
     decoded = []
     for content, enc in parts:
-        if isinstance(content, bytes):
-            decoded.append(content.decode(enc or "utf-8", errors="replace"))
-        else:
-            decoded.append(str(content))
+        if isinstance(content, bytes): decoded.append(content.decode(enc or "utf-8", errors="replace"))
+        else: decoded.append(str(content))
     return "".join(decoded)
-
 
 def extract_message_body(msg):
     collected = []
     if msg.is_multipart():
         for part in msg.walk():
-            ctype = (part.get_content_type() or "").lower()
-            if ctype in ("text/plain", "text/html"):
+            if part.get_content_type() in ("text/plain", "text/html"):
                 payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    collected.append(payload.decode(charset, errors="replace"))
+                if payload: collected.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
     else:
         payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            collected.append(payload.decode(charset, errors="replace"))
-
+        if payload: collected.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
     raw_text = "\n".join(collected)
-    raw_text = re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", raw_text, flags=re.IGNORECASE)
-    raw_text = re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", raw_text, flags=re.IGNORECASE)
     raw_text = re.sub(r"<[^>]+>", " ", raw_text)
-    raw_text = raw_text.replace("&#8377;", "₹").replace("&₹;", "₹")
     return re.sub(r"\s+", " ", raw_text).strip()
 
-
-def normalize_ref(val):
-    return re.sub(r"[^a-z0-9]", "", str(val or "").lower())
-
-
 def amount_in_paise(val):
-    try:
-        return int(round(float(val) * 100))
-    except Exception:
-        return None
+    try: return int(round(float(val) * 100))
+    except: return None
 
 # ============================================================================
-# 4. MATCHING LOGIC (FIXED)
+# 5. MATCHING & FETCH
 # ============================================================================
 def is_eligible_mail(mail, order):
     email_paise = amount_in_paise(mail.get("amount"))
-    order_paise = amount_in_paise(order.get("payable_amount") or order.get("amount"))
-
-    if email_paise is None or order_paise is None or email_paise <= 0:
-        return False
-
-    if email_paise != order_paise:
-        return False
-
+    order_paise = amount_in_paise(order.get("payable_amount"))
+    if email_paise is None or order_paise is None or email_paise != order_paise: return False
     rec_ts = int(mail.get("received_ts") or 0)
     cre_ts = int(order.get("created_ts") or 0)
     exp_ts = int(order.get("expires_ts") or (cre_ts + 900))
-
-    if not rec_ts or not cre_ts:
-        return False
-
     return (cre_ts - 7200) <= rec_ts <= (exp_ts + 7200)
 
-
 def matches_explicit_reference(mail, order):
-    if not is_eligible_mail(mail, order):
-        return False
+    if not is_eligible_mail(mail, order): return False
+    order_id = re.sub(r"[^a-z0-9]", "", str(order.get("id", "")).lower())
+    pay_ref = re.sub(r"[^a-z0-9]", "", str(order.get("reference", "")).lower())
+    m_raw = re.sub(r"[^a-z0-9]", "", str(mail.get("raw", "")).lower())
+    m_sub = re.sub(r"[^a-z0-9]", "", str(mail.get("subject", "")).lower())
+    
+    if order_id and (order_id in m_raw or order_id in m_sub): return True
+    if pay_ref and len(pay_ref) >= 6 and (pay_ref in m_raw or pay_ref in m_sub): return True
+    return True # Amount matched
 
-    order_id = normalize_ref(order.get("id"))
-    pay_ref = normalize_ref(order.get("reference") or order.get("utr"))
-    m_oid = normalize_ref(mail.get("orderId"))
-    m_raw = normalize_ref(mail.get("raw"))
-    m_sub = normalize_ref(mail.get("subject"))
-    m_utr = normalize_ref(mail.get("utr"))
-
-    if order_id and (m_oid == order_id or order_id in m_raw or order_id in m_sub):
-        return True
-
-    if pay_ref and len(pay_ref) >= 6 and (pay_ref in m_raw or pay_ref in m_sub or pay_ref == m_utr):
-        return True
-
-    email_paise = amount_in_paise(mail.get("amount"))
-    order_paise = amount_in_paise(order.get("payable_amount") or order.get("amount"))
-    if email_paise == order_paise and email_paise > 0:
-        return True
-
-    return False
-
-# ============================================================================
-# 5. GMAIL FETCH
-# ============================================================================
 def fetch_fampay_emails():
-    user = CONFIG["gmail_email"].strip().lower()
-    pw = re.sub(r"\s+", "", CONFIG["gmail_app_password"])
-    debug = {"connected": False, "totalScanned": 0, "famMatched": 0, "error": None, "emails_detail": []}
+    user, pw = CONFIG["gmail_email"].strip().lower(), re.sub(r"\s+", "", CONFIG["gmail_app_password"])
+    debug = {"connected": False, "totalScanned": 0, "famMatched": 0, "error": None}
     results = []
-
-    if not user or not pw:
-        debug["error"] = "Missing Gmail address or App Password"
-        return {"emails": results, "debug": debug}
-
+    if not user or not pw: return {"emails": results, "debug": debug}
     try:
         imap = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=10)
         imap.login(user, pw)
         debug["connected"] = True
         imap.select("INBOX", readonly=True)
-
         typ, data = imap.search(None, "ALL")
         msg_ids = data[0].split() if (typ == "OK" and data and data[0]) else []
         newest_ids = list(reversed(msg_ids[-40:]))
@@ -289,107 +212,44 @@ def fetch_fampay_emails():
 
         for mid in newest_ids:
             typ, msg_data = imap.fetch(mid, "(BODY.PEEK[])")
-            if typ != "OK" or not msg_data or not msg_data[0]:
-                continue
-            raw_bytes = msg_data[0][1]
-            msg = email.message_from_bytes(raw_bytes)
-            subj = decode_mime_header_str(msg.get("Subject", ""))
-            sender = decode_mime_header_str(msg.get("From", ""))
-            date_hdr = msg.get("Date", "")
-            try:
-                dt = parsedate_to_datetime(date_hdr)
-                rec_ts = int(dt.timestamp())
-            except Exception:
-                rec_ts = int(time.time())
-
-            body_text = extract_message_body(msg)
+            if typ != "OK" or not msg_data or not msg_data[0]: continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subj, sender = decode_mime_header_str(msg.get("Subject", "")), decode_mime_header_str(msg.get("From", ""))
+            try: rec_ts = int(parsedate_to_datetime(msg.get("Date", "")).timestamp())
+            except: rec_ts = int(time.time())
             
-            debug["emails_detail"].append({
-                "from": sender[:50],
-                "subject": subj[:50],
-                "amount_extracted": extract_amount(f"{subj}\n{body_text}")
-            })
-
-            if looks_like_fampay(sender, subj, body_text):
+            body = extract_message_body(msg)
+            if looks_like_fampay(sender, subj, body):
                 debug["famMatched"] += 1
-                full_text = f"{subj}\n{body_text}"
+                full_text = f"{subj}\n{body}"
                 amt = extract_amount(full_text)
-                utr = extract_utr(full_text)
-                fmp = extract_fampay_txn_id(full_text)
-                oid = extract_purpose(full_text)
-                if amt is not None or utr is not None or fmp is not None or oid is not None:
-                    results.append({
-                        "utr": utr or fmp,
-                        "fampayTxnId": fmp,
-                        "orderId": oid,
-                        "amount": amt,
-                        "subject": subj,
-                        "from": sender.lower(),
-                        "received_ts": rec_ts,
-                        "receivedAt": datetime.fromtimestamp(rec_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "raw": body_text[:800],
-                    })
-            if len(results) >= 10:
-                break
-
+                if amt:
+                    results.append({"utr": extract_utr(full_text), "orderId": extract_purpose(full_text), "amount": amt, "subject": subj, "received_ts": rec_ts, "raw": body[:800]})
+            if len(results) >= 10: break
         imap.logout()
-    except Exception as exc:
-        debug["error"] = str(exc)
-
+    except Exception as exc: debug["error"] = str(exc)
     return {"emails": results, "debug": debug}
 
-# ============================================================================
-# 6. VERIFY ORDER
-# ============================================================================
-def verify_order_against_mailbox(order, all_orders):
+def verify_order_against_mailbox(order):
     scan = fetch_fampay_emails()
-    emails = scan["emails"]
-    debug = scan["debug"]
-
-    for mail in emails:
+    for mail in scan["emails"]:
         if matches_explicit_reference(mail, order):
             order["status"] = "paid"
-            order["utr"] = mail.get("utr") or mail.get("fampayTxnId") or order.get("reference")
+            order["utr"] = mail.get("utr") or order.get("reference")
             order["paid_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            all_orders[order["id"]] = order
-            save_orders(all_orders)
-
-            if CONFIG["webhook_url"]:
-                try:
-                    payload = json.dumps({
-                        "event": "payment.Success",
-                        "status": "paid",
-                        "order_id": order["id"],
-                        "amount": order["amount"],
-                        "utr": order["utr"],
-                        "paid_at": order["paid_at"],
-                    }).encode("utf-8")
-                    sig = hmac.new(CONFIG["webhook_secret"].encode("utf-8"), payload, hashlib.sha256).hexdigest()
-                    req = Request(
-                        CONFIG["webhook_url"],
-                        data=payload,
-                        headers={"Content-Type": "application/json", "X-PayZapy-Signature": sig},
-                        method="POST",
-                    )
-                    urlopen(req, timeout=4)
-                except Exception:
-                    pass
-
-            return {"paid": True, "debug": debug}
-
-    return {"paid": False, "debug": debug}
+            save_order_db(order["id"], order)
+            return {"paid": True, "debug": scan["debug"]}
+    return {"paid": False, "debug": scan["debug"]}
 
 # ============================================================================
-# 7. VERCEL SERVERLESS HANDLER
+# 6. HANDLER
 # ============================================================================
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, payload, status=200):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -397,166 +257,78 @@ class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
         self.end_headers()
 
-    def do_GET(self):
-        self._handle_request("GET")
+    def do_GET(self): self._handle_request()
+    def do_POST(self): self._handle_request()
 
-    def do_POST(self):
-        self._handle_request("POST")
-
-    def _handle_request(self, method):
+    def _handle_request(self):
         parsed = urlparse(self.path)
-        query = {k.strip().lower(): v[0].strip() for k, v in parse_qs(parsed.query).items()}
-        if "=" in parsed.path:
-            tail = parsed.path.split("/")[-1]
-            for k, v in parse_qs(tail).items():
-                ck = k.strip().lower()
-                if ck and ck not in query:
-                    query[ck] = v[0].strip()
-        
+        query = {k.lower(): v[0].strip() for k, v in parse_qs(parsed.query).items()}
         raw_len = int(self.headers.get("Content-Length", "0") or "0")
-        body = {}
-        if raw_len > 0:
-            try:
-                body = json.loads(self.rfile.read(raw_len).decode("utf-8"))
-            except Exception:
-                body = {}
+        body = json.loads(self.rfile.read(raw_len).decode("utf-8")) if raw_len > 0 else {}
 
         action = (query.get("action") or body.get("action") or "").lower()
         if not action:
-            if "/check" in parsed.path:
-                action = "check"
-            elif "/verify" in parsed.path:
-                action = "verify"
-            elif "/health" in parsed.path:
-                action = "health"
-            elif query.get("order_id") or body.get("order_id"):
-                action = "check"
-            else:
-                action = "create"
+            if "/check" in parsed.path: action = "check"
+            elif query.get("order_id") or body.get("order_id"): action = "check"
+            else: action = "create"
 
         if action == "health":
-            return self._send_json({
-                "status": "ok",
-                "provider": "fampay",
-                "mode": "vercel_serverless",
-                "fampay_upi": CONFIG["fampay_upi"],
-                "gmail": CONFIG["gmail_email"],
-                "api_by": CONFIG["api_brand"],
-                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            })
-
-        orders = load_orders()
+            return self._send_json({"status": "ok", "mode": "vercel_firebase", "firebase_ready": db is not None})
 
         if action in ("check", "verify"):
-            order_id = (query.get("order_id") or body.get("order_id") or query.get("id") or "").strip()
-            if not order_id:
-                return self._send_json({"status": "error", "message": "order_id parameter is required"}, 400)
-
-            order = orders.get(order_id) or reconstruct_serverless_order(order_id)
-            if not order:
-                return self._send_json({"status": "error", "message": "Order not found"}, 404)
-
-            orders[order_id] = order
+            order_id = (query.get("order_id") or body.get("order_id") or "").strip()
+            if not order_id: return self._send_json({"status": "error", "message": "order_id required"}, 400)
+            
+            # DB se order lao
+            order = get_order_db(order_id) or reconstruct_serverless_order(order_id)
+            if not order: return self._send_json({"status": "error", "message": "Order not found"}, 404)
 
             if order.get("status") == "pending" and int(time.time()) > int(order.get("expires_ts", 0)):
                 order["status"] = "expired"
-                orders[order_id] = order
-                save_orders(orders)
+                save_order_db(order_id, order)
 
             verify_debug = None
             if order.get("status") == "pending":
-                res = verify_order_against_mailbox(order, orders)
+                res = verify_order_against_mailbox(order)
                 verify_debug = res.get("debug")
 
             return self._send_json({
-                "status": order["status"],
-                "order_id": order["id"],
-                "amount": float(order["amount"]),
-                "payable_amount": float(order["payable_amount"]),
-                "provider": "fampay",
-                "utr": order.get("utr"),
-                "time": order.get("created_at"),
-                "paid_at": order.get("paid_at"),
-                "debug": verify_debug,
-                "api_by": CONFIG["api_brand"],
+                "status": order["status"], "order_id": order["id"], "amount": order["amount"],
+                "utr": order.get("utr"), "paid_at": order.get("paid_at"), "debug": verify_debug
             })
 
-        # CREATE ORDER
-        req_key = (
-            self.headers.get("X-API-Key")
-            or query.get("api_key")
-            or query.get("apikey")
-            or query.get("key")
-            or body.get("api_key")
-            or body.get("apikey")
-            or body.get("key")
-            or ""
-        ).strip()
-        auth_hdr = self.headers.get("Authorization", "")
-        if not req_key and auth_hdr.lower().startswith("bearer "):
-            req_key = auth_hdr[7:].strip()
-
+        # Create Order
+        req_key = self.headers.get("X-API-Key") or query.get("api_key") or body.get("api_key") or ""
         if CONFIG["api_key"] and req_key != CONFIG["api_key"]:
-            return self._send_json({"status": "error", "code": "INVALID_API_KEY", "message": "Valid X-API-Key or api_key/apikey parameter is required."}, 401)
+            return self._send_json({"status": "error", "code": "INVALID_API_KEY"}, 401)
 
-        try:
-            amount = round(float(body.get("amount") or query.get("amount") or 0), 2)
-        except Exception:
-            amount = 0.0
-
-        if amount < 1.0:
-            return self._send_json({"status": "error", "message": "Invalid amount. Minimum amount is ₹1.00"}, 400)
+        try: amount = round(float(body.get("amount") or query.get("amount") or 0), 2)
+        except: amount = 0.0
+        if amount < 1.0: return self._send_json({"status": "error", "message": "Min amount ₹1"}, 400)
 
         now_ts = int(time.time())
         exp_ts = now_ts + (CONFIG["expiry_minutes"] * 60)
         paise_val = int(round(amount * 100))
         reference = str(random.randint(100000000000, 999999999999))
         order_id = f"ord_{now_ts}_{paise_val}_{reference}"
+        
         upi_link = build_upi_link(CONFIG["fampay_upi"], amount, CONFIG["merchant_name"], order_id, reference)
         qr_url = f"https://quickchart.io/qr?text={quote(upi_link)}&size=300"
-
-        proto = self.headers.get("X-Forwarded-Proto", "https")
-        host = self.headers.get("Host", "localhost")
-        base_path = "/api/index"  # Vercel pe default path
         
-        # Vercel ke hisaab se check URL
-        check_url = f"{proto}://{host}{base_path}?action=check&order_id={quote(order_id)}"
+        host = self.headers.get("Host", "localhost")
+        check_url = f"https://{host}/api/index?action=check&order_id={quote(order_id)}"
 
         new_order = {
-            "id": order_id,
-            "amount": amount,
-            "payable_amount": amount,
-            "provider": "fampay",
-            "upi_id": CONFIG["fampay_upi"],
-            "upi_link": upi_link,
-            "qr_url": qr_url,
-            "reference": reference,
-            "utr": None,
-            "status": "pending",
-            "created_ts": now_ts,
-            "expires_ts": exp_ts,
-            "created_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "expires_at": datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "paid_at": None,
+            "id": order_id, "amount": amount, "payable_amount": amount, "provider": "fampay",
+            "upi_id": CONFIG["fampay_upi"], "reference": reference, "status": "pending",
+            "created_ts": now_ts, "expires_ts": exp_ts, "paid_at": None,
         }
 
-        orders[order_id] = new_order
-        save_orders(orders)
+        save_order_db(order_id, new_order) # DB me save karo
 
         return self._send_json({
-            "status": "success",
-            "order_id": order_id,
-            "amount": amount,
-            "payable_amount": amount,
-            "provider": "fampay",
-            "upi_id": CONFIG["fampay_upi"],
-            "upi_link": upi_link,
-            "qr_url": qr_url,
-            "check_status_url": check_url,
-            "expires_at": new_order["expires_at"],
-            "api_by": CONFIG["api_brand"],
+            "status": "success", "order_id": order_id, "amount": amount, "upi_link": upi_link,
+            "qr_url": qr_url, "check_status_url": check_url, "expires_at": datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         }, 201)
