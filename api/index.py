@@ -23,7 +23,7 @@ from firebase_admin import credentials, firestore
 CONFIG = {
     "fampay_upi": os.environ.get("FAMPAY_UPI_ID", "shahid4900@fam"),
     "gmail_email": os.environ.get("GMAIL_EMAIL", "shahid2005afridi@gmail.com"),
-    "gmail_app_password": re.sub(r"\s+", "", os.environ.get("GMAIL_APP_PASSWORD", "fjrpfhfjzykefhga")),
+    "gmail_app_password": re.sub(r"\s+", "", os.environ.get("GMAIL_APP_PASSWORD", "eycpvlkisijmyssi")),
     "merchant_name": os.environ.get("MERCHANT_NAME", "Dgtl Store"),
     "api_key": os.environ.get("FAMPAY_API_KEY", "fp_live_5dd46fe835de54e91b6c4f9aabc0ea3d"),
     "expiry_minutes": int(os.environ.get("EXPIRY_MINUTES", "15")),
