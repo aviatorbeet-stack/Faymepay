@@ -1,1 +1,1 @@
-# No external dependencies required - all standard library
+firebase-admin
